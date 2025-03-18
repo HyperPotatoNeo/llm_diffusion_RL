@@ -40,13 +40,16 @@ def setup_args():
     parser.add_argument("--max_length", type=int, default=512, help="Max sequence length")
     parser.add_argument("--learning_rate", type=float, default=3e-6, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--temperature", type=float, default=0.6, help="Training policy temperature")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every X steps")
     parser.add_argument("--eval_steps", type=int, default=100, help="Evaluate every X steps")
+    parser.add_argument("--eval_freq", type=int, default=30, help="Evaluation frequency in steps")
+    parser.add_argument("--eval_size", type=int, default=100, help="Number of examples to evaluate on")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
-    # New argument to choose ZeRO optimization stage (2 or 3; defaulting to 3)
+    parser.add_argument("--drop_prob", type=float, default=0.5, help="probability of dropping timestep during policy update")
     parser.add_argument("--zero_stage", type=int, default=2, choices=[2, 3],
                         help="ZeRO optimization stage to use (2 or 3)")
     parser.add_argument("--ds_config", type=str, default='gsm8k/reinforce_ds_config.json', help="DeepSpeed config file")
@@ -285,7 +288,7 @@ class ReinforceTrainer:
             repeated_input_ids = selected_input_ids.repeat_interleave(self.args.k_samples, dim=0)
             
             with torch.no_grad():
-                outputs, traj = batch_generate(self.model_engine, prompt=repeated_input_ids, gen_length=256, block_length=32, steps=32, remasking='random', temperature=0.0)
+                outputs, traj = batch_generate(self.model_engine, prompt=repeated_input_ids, gen_length=256, block_length=32, steps=32, remasking='random', temperature=self.args.temperature)
             # For each query in the chunk, extract responses
             for j in range(selected_input_ids.size(0)):
                 prompt_ids = selected_input_ids[j]
@@ -388,6 +391,10 @@ class ReinforceTrainer:
 
                 if len(batch_inputs) == 0:
                     continue
+                
+                # Continue with probability drop_prob (for training efficiency)
+                if random.random() < self.args.drop_prob:
+                    continue
 
                 # Stack the collected input sequences to form a batch tensor.
                 batch_inputs_tensor = torch.stack(batch_inputs)  # [B, seq_length]
@@ -410,7 +417,7 @@ class ReinforceTrainer:
                 del batch_masks, batch_targets
 
                 # Compute log probabilities over the vocabulary.
-                log_probs_all = F.log_softmax(logits, dim=-1)  # [B, seq_length, vocab_size]
+                log_probs_all = F.log_softmax(logits/self.args.temperature, dim=-1)  # [B, seq_length, vocab_size]
                 del logits
                 # Gather log probabilities corresponding to target tokens.
                 gathered = torch.gather(log_probs_all, dim=-1, index=full_targets.unsqueeze(-1)).squeeze(-1)  # [B, seq_length]
@@ -468,15 +475,16 @@ class ReinforceTrainer:
         return torch.tensor(loss).to(self.device), torch.tensor(rewards).to(self.device).mean()
     
     def train(self):
-        """Main training loop with DistributedSampler."""
+        """Main training loop with DistributedSampler and periodic evaluation."""
         logger.info("Starting training...")
         if dist.get_rank() == 0:
             wandb.init(project="llada-gsm8k", config=vars(self.args))
 
-        # Note: Keeping a global step counter across epochs may be preferable
+        # Add evaluation frequency to args or use default
+        eval_freq = getattr(self.args, "eval_freq", 100)
+
         for epoch in range(self.args.num_train_epochs):
             self.epoch = epoch
-            # Do not reset global_step across epochs to avoid checkpoint collisions.
             epoch_loss = 0
             steps_this_epoch = 0
 
@@ -491,9 +499,12 @@ class ReinforceTrainer:
                 if step >= self.steps_per_epoch:
                     break
 
+                # Run evaluation at specified frequency
+                self.evaluate()
+                
                 loss, rewards = self.train_step(batch)
                 dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(rewards, op=dist.ReduceOp.SUM)
+                dist.all_reduce(rewards, op=dist.ReduceOp.AVG)
                 epoch_loss += loss
                 steps_this_epoch += 1
                 self.global_step += 1
@@ -510,22 +521,116 @@ class ReinforceTrainer:
                         "avg_reward": rewards.detach().cpu()
                     })
 
-                #if self.global_step % self.args.eval_steps == 0:
-                #    self.evaluate()
-
-                #if self.global_step % self.args.save_steps == 0:
-                #    self.save_checkpoint()
+                if self.global_step % self.args.save_steps == 0:
+                    pass
+                    #self.save_checkpoint()
 
             avg_epoch_loss = epoch_loss / steps_this_epoch
             logger.info(f"Epoch {epoch} completed. Average loss: {avg_epoch_loss:.4f}")
-            self.save_checkpoint(f"epoch_{epoch}")
+            
+            # Run evaluation at the end of each epoch
+            self.evaluate()
 
-        logger.info("Training completed.")
+    logger.info("Training completed.")
     
     def evaluate(self):
-        """Run evaluation on a small subset of the data."""
-        # Implement evaluation logic here
-        pass
+        """
+        Evaluate the model on the test set in batches and report success rate (average reward).
+        
+        Args:
+            eval_freq (int): How often to run evaluation (in steps)
+        
+        Returns:
+            float: Average reward (success rate) on the test set
+        """
+        if self.global_step % self.args.eval_freq != 0:
+            return None
+        
+        logger.info(f"Running evaluation at step {self.global_step}...")
+        
+        # Switch to evaluation mode
+        self.model_engine.eval()
+        
+        # Load the test dataset
+        eval_dataset = load_dataset('openai/gsm8k', 'main')['test']
+        
+        # Create a distributed sampler for the test set
+        eval_sampler = DistributedSampler(
+            eval_dataset, 
+            num_replicas=self.world_size,
+            rank=self.global_rank,
+            shuffle=False
+        )
+        
+        # Create a dataloader with the sampler
+        eval_batch_size = 8#min(8, self.args.batch_size * 2)  # Can use larger batch size for evaluation
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=eval_batch_size,
+            sampler=eval_sampler,
+            drop_last=False
+        )
+        
+        # Track total and correct predictions
+        total_rewards = []
+        
+        # Process batches
+        for batch in tqdm(eval_dataloader, desc="Evaluating", disable=self.global_rank != 0):
+            # Prepare the batch using the existing function
+            inputs = prepare_batch_for_gpu(batch, self.tokenizer)
+            
+            # Generate responses (one per input)
+            with torch.no_grad():
+                outputs, _ = batch_generate(
+                    self.model_engine, 
+                    prompt=inputs["input_ids"], 
+                    gen_length=256, 
+                    block_length=32, 
+                    steps=32, 
+                    remasking='random', 
+                    temperature=0.0  # Using a higher temperature for generation
+                )
+            
+            # Process each sample in the batch
+            for i, (question, answer, output) in enumerate(zip(batch["question"], batch["answer"], outputs)):
+                # Determine the prompt length to extract only the generated content
+                prompt_ids = inputs["input_ids"][i]
+                prompt_len = (prompt_ids != MASK_ID).sum().item()
+                
+                # Extract the generated response
+                response_ids = output[prompt_len:]
+                response = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                
+                # Calculate reward
+                reward = self.reward_function([question], [response], [answer])[0]
+                total_rewards.append(reward)
+        
+        # Gather rewards from all GPUs
+        all_rewards = [None for _ in range(self.world_size)]
+        dist.all_gather_object(all_rewards, total_rewards)
+        
+        # Calculate the average reward
+        if self.global_rank == 0:
+            # Flatten the list of rewards
+            flat_rewards = [r for sublist in all_rewards for r in sublist if r is not None]
+            average_reward = sum(flat_rewards) / len(flat_rewards) if flat_rewards else 0
+            
+            logger.info(f"Evaluation results at step {self.global_step}: Average reward = {average_reward:.4f} (Success rate: {average_reward*100:.2f}%)")
+            
+            # Log to wandb
+            wandb.log({
+                "eval_reward": average_reward,
+                "eval_success_rate": average_reward * 100,  # as percentage
+                "global_step": self.global_step
+            })
+            
+            # Switch back to training mode
+            self.model_engine.train()
+            return average_reward
+        
+        # Switch back to training mode
+        self.model_engine.train()
+        return None
     
     def save_checkpoint(self, suffix=""):
         """Save model checkpoint."""
