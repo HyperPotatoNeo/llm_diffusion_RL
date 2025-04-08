@@ -79,7 +79,7 @@ def setup_args():
     parser.add_argument("--replay_buffer_size", type=int, default=1024, help="Replay buffer size")
     parser.add_argument("--generation_batch_size", type=int, default=16, help="Generation batch size")
     parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
-    parser.add_argument("--generate_every", type=int, default=8, help="Sample generation frequency")
+    parser.add_argument("--generate_every", type=int, default=16, help="Sample generation frequency")
     parser.add_argument("--eval_freq", type=int, default=100, help="Evaluation frequency")
     
     return parser.parse_args()
@@ -314,15 +314,13 @@ class RWRTrainer:
                 conversations.append(formatted + responses[i] + '<|eot_id|>')
         
         prompt_encodings = self.tokenizer(formatted_questions)
+        prompt_lengths = [len(item) for item in prompt_encodings['input_ids']]
         encodings = {"prompt_input_ids": self._pad_and_convert_to_tensor(prompt_encodings['input_ids'], MASK_ID)}
-        # calculate prompt length
-        
+        encodings["prompt_length"] = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
         
         if prepare_responses:
             conv_encodings = self.tokenizer(conversations)
             encodings["conv_input_ids"] = self._pad_and_convert_to_tensor(conv_encodings['input_ids'], self.tokenizer.eos_token_id)
-            prompt_lengths = [len(item) for item in prompt_encodings['input_ids']]
-            encodings["prompt_length"] = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
 
         return encodings
     
@@ -335,6 +333,7 @@ class RWRTrainer:
             input_ids_list[i] = input_ids_list[i] + [pad_token_id] * padding_length
             
         return torch.tensor(input_ids_list).to(self.device)
+
     def generate_samples(self, dataset, num_samples=None):
         """Generate samples from the model for GSM8K problems"""
         self.model_engine.eval()
@@ -386,8 +385,7 @@ class RWRTrainer:
             
             for idx, output in enumerate(outputs):
                 # Determine the prompt length to extract only the generated content
-                prompt_ids = encodings["prompt_input_ids"][idx]
-                prompt_len = (prompt_ids != MASK_ID).sum().item()
+                prompt_len = encodings["prompt_length"][idx]
                 
                 # Extract the generated response
                 response_ids = output[prompt_len:]
@@ -518,20 +516,29 @@ class RWRTrainer:
         # Compute weighted cross-entropy loss for masked tokens
         token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
         
-        # Weight loss by inverse mask probability and reward
+        # Weight loss by inverse mask probability and normalize by answer length
         weighted_loss = token_loss / p_mask_masked
         normalized_loss = weighted_loss / answer_lengths_masked
-
-        # Convert rewards to tensor and expand to match normalized_loss shape
-        rewards_expanded = torch.tensor(rewards, device=device).unsqueeze(1).expand(-1, seq_len)
-        rewards_flat = rewards_expanded.reshape(-1)
-        rewards_masked = rewards_flat[masked_positions.view(-1)]
         
-        # Compute final loss
-        reward_weighted_loss = normalized_loss * rewards_masked
+        # First, compute per-example losses by aggregating token losses
+        # Create a mapping from each masked token back to its example index
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
+        batch_indices_flat = batch_indices.reshape(-1)
+        batch_indices_masked = batch_indices_flat[masked_positions.view(-1)]
+        
+        # Aggregate normalized token losses per example
+        per_example_losses = torch.zeros(batch_size, device=device)
+        per_example_losses.scatter_add_(0, batch_indices_masked, normalized_loss)
+        
+        # Convert rewards to tensor of shape [batch_size]
+        # Can use reward as is or exp(reward)
+        rewards_tensor = torch.exp(torch.tensor(rewards, device=device))
+        
+        # Apply rewards at the example level
+        reward_weighted_losses = per_example_losses * rewards_tensor
         
         # Average over batch
-        loss = reward_weighted_loss.sum() / batch_size
+        loss = reward_weighted_losses.sum() / batch_size
         
         return loss
 
@@ -543,7 +550,7 @@ class RWRTrainer:
         
         # Initial model samples
         logger.info("Generating initial samples for replay buffer...")
-        initial_samples = self.generate_samples(self.dataset, self.replay_buffer_size)
+        initial_samples = self.generate_samples(self.dataset, self.args.replay_buffer_size)
         
         for sample in initial_samples:
             self.replay_buffer.add(sample)
@@ -562,8 +569,8 @@ class RWRTrainer:
             
             for step in range(num_update_steps_per_epoch):
                 # # Run evaluation at specified frequency
-                # if self.global_step % self.args.eval_freq == 0:
-                #     self.evaluate()
+                if self.global_step % self.args.eval_freq == 0:
+                    self.evaluate()
                 
                 # Sample from replay buffer
                 batch_samples = self.replay_buffer.sample(self.args.batch_size * self.args.grad_accum_steps)
@@ -651,13 +658,13 @@ class RWRTrainer:
         # Switch to evaluation mode
         self.model_engine.eval()
 
-        dataset_size = len(self.eval_dataset)
-        indices = torch.randperm(dataset_size)[:256].tolist()
-        subset = torch.utils.data.Subset(self.eval_dataset, indices)
+        # dataset_size = len(self.eval_dataset)
+        # indices = torch.randperm(dataset_size)[:256].tolist()
+        # subset = torch.utils.data.Subset(self.eval_dataset, indices)
         
         # Create a distributed sampler for the evaluation dataset
         eval_sampler = DistributedSampler(
-            subset, 
+            self.eval_dataset, 
             num_replicas=self.world_size,
             rank=self.global_rank,
             shuffle=True,
@@ -666,7 +673,7 @@ class RWRTrainer:
         # Create a dataloader with the sampler
         eval_batch_size = 16  # Can use larger batch size for evaluation
         eval_dataloader = DataLoader(
-            subset,
+            self.eval_dataset,
             batch_size=eval_batch_size,
             sampler=eval_sampler,
             drop_last=True,
