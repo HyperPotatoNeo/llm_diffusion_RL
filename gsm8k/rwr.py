@@ -50,7 +50,7 @@ def setup_args():
     parser.add_argument("--output_dir", type=str, default="/home/mila/j/jain.vineet/scratch/llada_checkpoints", help="Directory to save model")
     
     # Training arguments
-    parser.add_argument("--num_train_epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--num_train_epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU/CPU")
     parser.add_argument("--grad_accum_steps", type=int, default=4, help="Steps to accumulate before backward pass")
     parser.add_argument("--learning_rate", type=float, default=1e-6, help="Initial learning rate")
@@ -58,7 +58,8 @@ def setup_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="Learning rate scheduler")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup steps ratio")
-    parser.add_argument("--max_length", type=int, default=1024, help="Max sequence length")
+    parser.add_argument("--max_length", type=int, default=256, help="Max sequence length")
+    parser.add_argument("--block_length", type=int, default=32, help="Block length")
     
     # DeepSpeed arguments
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
@@ -77,10 +78,10 @@ def setup_args():
     
     # RWR specific arguments
     parser.add_argument("--replay_buffer_size", type=int, default=1024, help="Replay buffer size")
-    parser.add_argument("--generation_batch_size", type=int, default=16, help="Generation batch size")
+    parser.add_argument("--generation_batch_size", type=int, default=32, help="Generation batch size")
     parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
-    parser.add_argument("--generate_every", type=int, default=16, help="Sample generation frequency")
-    parser.add_argument("--eval_freq", type=int, default=100, help="Evaluation frequency")
+    parser.add_argument("--generate_every", type=int, default=8, help="Sample generation frequency")
+    parser.add_argument("--eval_freq", type=int, default=64, help="Evaluation frequency")
     
     return parser.parse_args()
 
@@ -339,7 +340,7 @@ class RWRTrainer:
         self.model_engine.eval()
         
         if num_samples is None:
-            num_samples = self.args.generation_batch_size * 32
+            num_samples = self.args.generation_batch_size * 16
         
         # Create a subset of indices to use
         dataset_size = len(dataset)
@@ -371,9 +372,9 @@ class RWRTrainer:
                 outputs, _ = batch_generate(
                     self.model_engine, 
                     prompt=encodings["prompt_input_ids"], 
-                    gen_length=256, 
-                    block_length=32, 
-                    steps=32, 
+                    gen_length=self.args.max_length, 
+                    block_length=self.args.block_length, 
+                    steps=self.args.block_length, 
                     remasking='random', 
                     temperature=self.args.temperature
                 )
@@ -433,7 +434,8 @@ class RWRTrainer:
         encodings = self.prepare_batch_for_gpu(batch, prepare_responses=True)
         
         # Get rewards directly from the batch
-        rewards = batch["reward"]
+        rewards = torch.tensor(batch["reward"], device=self.device)
+        rewards = rewards - rewards.mean()
         
         # Forward pass and loss calculation
         loss = self.compute_loss(self.model_engine, encodings, rewards, self.device)
@@ -448,7 +450,7 @@ class RWRTrainer:
         
         return loss, rewards.mean()
 
-    def compute_loss(self, model, encodings, rewards, device, eps=1e-3):
+    def compute_loss(self, model, encodings, rewards, device, eps=1e-3, block_length=32):
         """
         Compute discrete diffusion loss for LLaDA model, weighted by rewards.
         """
@@ -462,36 +464,73 @@ class RWRTrainer:
         t = torch.rand(batch_size, device=device)
         # Scale probabilities between eps and 1-eps
         p_mask = (1 - eps) * t + eps
-        # Expand to shape [batch_size, seq_len]
-        p_mask = p_mask.unsqueeze(1).expand(-1, seq_len)
+        
+        # Calculate the answer length for each example
+        answer_lengths = seq_len - prompt_lengths
         
         # Create a mask for tokens that should be considered for masking
-        # (only answer tokens should be masked, not prompt tokens)
         token_positions = torch.arange(seq_len, device=device).expand(batch_size, seq_len)
+        
+        # Initialize masks
+        # 1. block_mask: identifies tokens in the selected block (for current processing)
+        # 2. context_mask: identifies tokens that should remain unmasked (prompt + blocks before current)
+        # 3. future_mask: identifies tokens that should remain masked (blocks after current)
+        block_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        context_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        future_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        
+        # For each sequence, determine its blocks and select one randomly
+        for i in range(batch_size):
+            # Calculate number of blocks for this specific sequence
+            sequence_num_blocks = (answer_lengths[i] + block_length - 1) // block_length
+            
+            # Only proceed if there are blocks to process
+            if sequence_num_blocks > 0:
+                # Randomly select a block index for this sequence
+                block_idx = torch.randint(0, sequence_num_blocks, (1,), device=device).item()
+                
+                # Calculate start and end positions for the selected block
+                block_start = prompt_lengths[i] + block_idx * block_length
+                block_end = min(block_start + block_length, prompt_lengths[i] + answer_lengths[i])
+                
+                # Set the selected block positions to True in the block mask
+                block_mask[i, block_start:block_end] = True
+                
+                # Set the context mask (prompt + blocks before current block)
+                context_mask[i, :block_start] = True
+                
+                # Set the future mask (blocks after current block)
+                future_mask[i, block_end:] = True
+        
+        # Create prompt mask (tokens before the prompt_length)
         prompt_mask = token_positions < prompt_lengths.unsqueeze(1)
         
-        # Generate random mask indices based on p_mask, but only for answer tokens
-        rand_mask = torch.rand(batch_size, seq_len, device=device)
-        # Ensure prompt tokens are never masked by setting their rand_mask values to > 1
-        rand_mask.masked_fill_(prompt_mask, 2.0)
-        masked_indices = rand_mask < p_mask
+        # Ensure context includes the prompt tokens
+        context_mask = context_mask | prompt_mask
         
-        # Create noisy batch by replacing masked tokens with mask_id
-        noisy_batch = torch.where(masked_indices, MASK_ID, input_ids)
+        # Only block tokens can be considered for masking
+        maskable_tokens = block_mask & ~context_mask
         
-        # Double-check that prompt tokens are not masked
-        noisy_batch = torch.where(prompt_mask, input_ids, noisy_batch)
-
-        # Calculate the answer length for each example (including padded tokens)
-        answer_lengths = seq_len - prompt_lengths
+        # Determine which tokens to actually mask based on p_mask
+        p_mask = p_mask.unsqueeze(1).expand_as(maskable_tokens)
+        rand_mask = torch.rand_like(p_mask)
+        masked_indices = (rand_mask < p_mask) & maskable_tokens
+        
+        # Create noisy batch:
+        # 1. Replace selected tokens in current block with MASK_ID
+        # 2. Keep context tokens as is
+        # 3. Set future tokens to MASK_ID to maintain causality
+        noisy_batch = input_ids.clone()
+        noisy_batch[masked_indices] = MASK_ID  # Mask selected tokens in current block
+        noisy_batch[future_mask] = MASK_ID     # Mask all future tokens
         
         # Forward pass through the model with noisy input
         model_outputs = model(noisy_batch)
         logits = model_outputs.logits
         
-        # Only compute loss for the masked tokens
-        # Extract logits and target tokens for masked positions
-        masked_positions = (noisy_batch == MASK_ID)
+        # Only compute loss for the masked tokens in the current block
+        # (not for future tokens that are forcibly masked)
+        masked_positions = masked_indices
         
         if masked_positions.sum() == 0:
             # If no tokens were masked, return zero loss
@@ -508,19 +547,31 @@ class RWRTrainer:
         p_mask_flat = p_mask.reshape(-1)
         p_mask_masked = p_mask_flat[masked_positions.view(-1)]
         
-        # Create a tensor of answer lengths that matches the shape of masked positions
-        answer_lengths_expanded = answer_lengths.unsqueeze(1).expand(-1, seq_len)
-        answer_lengths_flat = answer_lengths_expanded.reshape(-1)
-        answer_lengths_masked = answer_lengths_flat[masked_positions.view(-1)]
+        # Calculate the size of each block (for normalization)
+        block_sizes_expanded = torch.zeros_like(input_ids, dtype=torch.float)
+        
+        for i in range(batch_size):
+            # Find all positions that are part of the selected block for this sequence
+            block_positions = block_mask[i].nonzero().squeeze(-1)
+            
+            if len(block_positions) > 0:
+                # Get block size for this sequence (number of tokens in the block)
+                block_size = len(block_positions)
+                
+                # Set the block size value for all positions in this block
+                block_sizes_expanded[i, block_positions] = block_size
+        
+        # Get block sizes for masked positions
+        block_sizes_flat = block_sizes_expanded.reshape(-1)
+        block_sizes_masked = block_sizes_flat[masked_positions.view(-1)]
         
         # Compute weighted cross-entropy loss for masked tokens
         token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
         
-        # Weight loss by inverse mask probability and normalize by answer length
+        # Weight loss by inverse mask probability and normalize by block size
         weighted_loss = token_loss / p_mask_masked
-        normalized_loss = weighted_loss / answer_lengths_masked
+        normalized_loss = weighted_loss / block_sizes_masked
         
-        # First, compute per-example losses by aggregating token losses
         # Create a mapping from each masked token back to its example index
         batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
         batch_indices_flat = batch_indices.reshape(-1)
@@ -531,7 +582,6 @@ class RWRTrainer:
         per_example_losses.scatter_add_(0, batch_indices_masked, normalized_loss)
         
         # Convert rewards to tensor of shape [batch_size]
-        # Can use reward as is or exp(reward)
         rewards_tensor = torch.exp(torch.tensor(rewards, device=device))
         
         # Apply rewards at the example level
@@ -620,7 +670,7 @@ class RWRTrainer:
                     if self.global_step % self.args.generate_every == 0:
                         logger.info("Generating new samples for replay buffer...")
                         # generate 32 batches of samples, this should probably be a separate hyperparameter
-                        new_samples = self.generate_samples(self.dataset, self.args.generation_batch_size * 32)
+                        new_samples = self.generate_samples(self.dataset, self.args.generation_batch_size * 16)
                         
                         for sample in new_samples:
                             self.replay_buffer.add(sample)
@@ -640,7 +690,7 @@ class RWRTrainer:
             # Generate new samples at end of epoch
             logger.info("Generating new samples for replay buffer...")
             # generate 32 batches of samples, this should probably be a separate hyperparameter
-            new_samples = self.generate_samples(self.dataset, self.args.generation_batch_size * 32)
+            new_samples = self.generate_samples(self.dataset, self.args.generation_batch_size * 16)
             
             for sample in new_samples:
                 self.replay_buffer.add(sample)
@@ -658,22 +708,22 @@ class RWRTrainer:
         # Switch to evaluation mode
         self.model_engine.eval()
 
-        # dataset_size = len(self.eval_dataset)
-        # indices = torch.randperm(dataset_size)[:256].tolist()
-        # subset = torch.utils.data.Subset(self.eval_dataset, indices)
+        dataset_size = len(self.eval_dataset)
+        indices = torch.randperm(dataset_size)[:256].tolist()
+        subset = torch.utils.data.Subset(self.eval_dataset, indices)
         
         # Create a distributed sampler for the evaluation dataset
         eval_sampler = DistributedSampler(
-            self.eval_dataset, 
+            subset, 
             num_replicas=self.world_size,
             rank=self.global_rank,
             shuffle=True,
         )
         
         # Create a dataloader with the sampler
-        eval_batch_size = 16  # Can use larger batch size for evaluation
+        eval_batch_size = self.args.generation_batch_size  # Can use larger batch size for evaluation
         eval_dataloader = DataLoader(
-            self.eval_dataset,
+            subset,
             batch_size=eval_batch_size,
             sampler=eval_sampler,
             drop_last=True,
@@ -693,9 +743,9 @@ class RWRTrainer:
                 outputs, _ = batch_generate(
                     self.model_engine, 
                     prompt=encodings["prompt_input_ids"], 
-                    gen_length=256, 
-                    block_length=32, 
-                    steps=32, 
+                    gen_length=self.args.max_length, 
+                    block_length=self.args.block_length, 
+                    steps=self.args.block_length, 
                     remasking='random', 
                     temperature=0.0
                 )
